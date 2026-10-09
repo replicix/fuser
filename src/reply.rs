@@ -9,11 +9,13 @@
 use std::convert::AsRef;
 use std::ffi::OsStr;
 use std::io::IoSlice;
+use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::SystemTime;
 
+use log::debug;
 use log::error;
 use log::warn;
 
@@ -33,15 +35,22 @@ use crate::ll::reply::DirEntryPlus;
 use crate::ll::reply::Response;
 use crate::ll::{self};
 use crate::passthrough::BackingId;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use crate::uring::ring::RingCommit;
 
 /// Generic reply callback to send data
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ReplySender {
     Channel(ChannelSender),
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    Ring(RingCommit),
     #[cfg(test)]
     Assert(AssertSender),
     #[cfg(test)]
     Sync(std::sync::mpsc::SyncSender<()>),
+    /// Hands every reply's bytes to the test, which can also see that none was sent.
+    #[cfg(test)]
+    Capture(std::sync::mpsc::Sender<Vec<u8>>),
 }
 
 impl ReplySender {
@@ -49,6 +58,8 @@ impl ReplySender {
     pub(crate) fn send(&self, data: &[IoSlice<'_>]) -> std::io::Result<()> {
         match self {
             ReplySender::Channel(sender) => sender.send(data),
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => commit.commit(data),
             #[cfg(test)]
             ReplySender::Assert(sender) => sender.send(data),
             #[cfg(test)]
@@ -56,6 +67,149 @@ impl ReplySender {
                 sender.send(()).unwrap();
                 Ok(())
             }
+            #[cfg(test)]
+            ReplySender::Capture(sender) => {
+                let bytes = data.iter().flat_map(|s| s.iter().copied()).collect();
+                sender.send(bytes).unwrap();
+                Ok(())
+            }
+        }
+    }
+
+    /// The ring writes into the entry's own buffer when it can; otherwise a heap buffer is
+    /// filled and sent. Exactly one reply is sent whatever `f` does.
+    pub(crate) fn fill<F>(&self, unique: ll::RequestId, max_len: usize, f: F) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        self.fill_with(unique, max_len, true, f)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): `fill`, with the ring's buffer handed to `f` unzeroed
+    /// when `zero` is false (`RingCommit::fill_with`); a heap buffer is always zeroed.
+    fn fill_with<F>(
+        &self,
+        unique: ll::RequestId,
+        max_len: usize,
+        zero: bool,
+        f: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        let f = match self {
+            ReplySender::Ring(commit) => match commit.fill_with(max_len, zero, f)? {
+                None => return Ok(()),
+                Some(f) => f,
+            },
+            _ => f,
+        };
+        // Armed until the reply is out, so a panic while framing the count still answers EIO
+        let guard = EioOnUnwind {
+            sender: self,
+            unique,
+        };
+        let mut buf = vec![0u8; max_len];
+        let res = match f(&mut buf) {
+            Ok(n) if n <= max_len && n <= MAX_PAYLOAD => {
+                ll::ResponseSlice(&buf[..n]).with_iovec(unique, |iov| self.send(iov))
+            }
+            Ok(n) => {
+                error!(
+                    "reply for request {} claims {n} bytes in a {max_len} byte buffer; replying \
+                     EINVAL",
+                    unique.0
+                );
+                ll::ResponseErrno(Errno::EINVAL).with_iovec(unique, |iov| self.send(iov))
+            }
+            Err(errno) => ll::ResponseErrno(errno).with_iovec(unique, |iov| self.send(iov)),
+        };
+        std::mem::forget(guard);
+        res
+    }
+
+    /// CONSTELLATION PATCH (io-uring): `fill`'s gather form. Over a ring
+    /// the segments are written straight into the entry's payload, one
+    /// copy and no syscall; over `/dev/fuse` they go out as one
+    /// `writev(2)` with no copy at all, which is strictly less work than
+    /// joining them into a buffer and calling `data()`.
+    pub(crate) fn gather<B: AsRef<[u8]>>(
+        &self,
+        unique: ll::RequestId,
+        segments: &[B],
+    ) -> std::io::Result<()> {
+        let total = segments
+            .iter()
+            .try_fold(0usize, |sum, s| sum.checked_add(s.as_ref().len()))
+            .ok_or_else(|| std::io::Error::other("gathered reply length overflows"))?;
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        if matches!(self, ReplySender::Ring(_)) {
+            // Every byte of the buffer is overwritten, so it is not zeroed first
+            return self.fill_with(unique, total, false, |buf| {
+                let mut at = 0;
+                for segment in segments {
+                    let segment = segment.as_ref();
+                    buf[at..at + segment.len()].copy_from_slice(segment);
+                    at += segment.len();
+                }
+                Ok(at)
+            });
+        }
+        let _ = total;
+        let slices: smallvec::SmallVec<[IoSlice<'_>; 4]> =
+            segments.iter().map(|s| IoSlice::new(s.as_ref())).collect();
+        ll::ResponseSegments(slices.as_slice()).with_iovec(unique, |iov| self.send(iov))
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the transport this reply goes out over.
+    pub(crate) fn transport(&self) -> crate::Transport {
+        match self {
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => commit.transport(),
+            _ => crate::Transport::DevFuse,
+        }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): whether the request's pages are registered for
+    /// `READ_FIXED` (plan 38 Z4); see [`ReplyData::zero_copy`].
+    pub(crate) fn zero_copied(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => commit.zero_copied(),
+            _ => false,
+        }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a reply of `len` bytes of `src` from `offset`; see
+    /// [`ReplyData::read_fixed`]. Over `/dev/fuse` (and over a ring whose request payload is
+    /// still borrowed) it is `fill` with a `pread(2)` into the buffer.
+    pub(crate) fn read_fixed(
+        &self,
+        unique: ll::RequestId,
+        src: Box<dyn AsFd + Send>,
+        offset: u64,
+        len: usize,
+    ) -> std::io::Result<()> {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        let src = match self {
+            ReplySender::Ring(commit) => match commit.read_fixed(src, offset, len)? {
+                None => return Ok(()),
+                Some(src) => src,
+            },
+            _ => src,
+        };
+        self.fill_with(unique, len, false, |buf| {
+            pread_full(src.as_fd(), buf, offset).map_err(Errno::from)
+        })
+    }
+
+    /// Records that a reply object was created for the request, so a transport that answers
+    /// unreplied requests itself knows one is coming.
+    pub(crate) fn reply_created(&self) {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        if let ReplySender::Ring(commit) = self {
+            commit.reply_created();
         }
     }
 
@@ -63,10 +217,12 @@ impl ReplySender {
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
         match self {
             ReplySender::Channel(sender) => sender.open_backing(fd),
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => BackingId::create(commit.device(), fd),
             #[cfg(test)]
-            ReplySender::Assert(_) => unreachable!(),
-            #[cfg(test)]
-            ReplySender::Sync(_) => unreachable!(),
+            ReplySender::Assert(_) | ReplySender::Sync(_) | ReplySender::Capture(_) => {
+                unreachable!()
+            }
         }
     }
 
@@ -74,16 +230,74 @@ impl ReplySender {
     pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
         match self {
             ReplySender::Channel(sender) => unsafe { sender.wrap_backing(id) },
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => unsafe { BackingId::wrap_raw(commit.device(), id) },
             #[cfg(test)]
-            ReplySender::Assert(_) => unreachable!(),
-            #[cfg(test)]
-            ReplySender::Sync(_) => unreachable!(),
+            ReplySender::Assert(_) | ReplySender::Sync(_) | ReplySender::Capture(_) => {
+                unreachable!()
+            }
         }
     }
 }
 
+/// The largest payload `fuse_out_header.len` can describe.
+const MAX_PAYLOAD: usize = u32::MAX as usize - size_of::<ll::fuse_abi::fuse_out_header>();
+
+/// CONSTELLATION PATCH (io-uring): `pread(2)` until `buf` is full or the file ends; the count
+/// read. Short only at the end of the file, as a read reply must be.
+pub(crate) fn pread_full(
+    fd: BorrowedFd<'_>,
+    buf: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    let mut done = 0;
+    while done < buf.len() {
+        let at = offset
+            .checked_add(done as u64)
+            .and_then(|at| libc::off_t::try_from(at).ok())
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        match nix::sys::uio::pread(fd, &mut buf[done..], at) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(done)
+}
+
+/// Answers `EIO` if a `fill` closure unwinds, so the request gets its one reply; disarmed with
+/// `mem::forget` once the reply is sent.
+struct EioOnUnwind<'a> {
+    sender: &'a ReplySender,
+    unique: ll::RequestId,
+}
+
+impl Drop for EioOnUnwind<'_> {
+    fn drop(&mut self) {
+        warn!(
+            "Reply closure for operation {} panicked, replying with I/O error",
+            self.unique.0
+        );
+        let res =
+            ll::ResponseErrno(Errno::EIO).with_iovec(self.unique, |iov| self.sender.send(iov));
+        log_send(res);
+    }
+}
+
+/// Logs a failed send; a reply after the connection ended is expected during teardown.
+fn log_send(res: std::io::Result<()>) {
+    match res {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {
+            debug!("Failed to send FUSE reply: {err}");
+        }
+        Err(err) => error!("Failed to send FUSE reply: {err}"),
+    }
+}
+
 #[cfg(test)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct AssertSender {
     expected: Vec<u8>,
 }
@@ -127,18 +341,54 @@ impl Reply for ReplyRaw {
 }
 
 impl ReplyRaw {
+    /// CONSTELLATION PATCH (io-uring): see [`ReplyData::transport`].
+    pub(crate) fn transport(&self) -> crate::Transport {
+        self.sender
+            .as_ref()
+            .map_or(crate::Transport::DevFuse, ReplySender::transport)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): see [`ReplyData::zero_copy`].
+    pub(crate) fn zero_copied(&self) -> bool {
+        self.sender.as_ref().is_some_and(ReplySender::zero_copied)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): see [`ReplyData::read_fixed`].
+    pub(crate) fn send_read_fixed(mut self, src: Box<dyn AsFd + Send>, offset: u64, len: usize) {
+        assert!(self.sender.is_some());
+        let sender = self.sender.take().unwrap();
+        log_send(sender.read_fixed(self.unique, src, offset, len));
+    }
+
     /// Reply to a request with the given error code and data. Must be called
     /// only once (the `ok` and `error` methods ensure this by consuming `self`)
     pub(crate) fn send_ll_mut(&mut self, response: &impl Response) {
         assert!(self.sender.is_some());
         let sender = self.sender.take().unwrap();
         let res = response.with_iovec(self.unique, |iov| sender.send(iov));
-        if let Err(err) = res {
-            error!("Failed to send FUSE reply: {err}");
-        }
+        log_send(res);
     }
     pub(crate) fn send_ll(mut self, response: &impl Response) {
         self.send_ll_mut(response);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): `send_fill`'s gather form; see
+    /// [`ReplySender::gather`].
+    pub(crate) fn send_gather<B: AsRef<[u8]>>(mut self, segments: &[B]) {
+        assert!(self.sender.is_some());
+        let sender = self.sender.take().unwrap();
+        log_send(sender.gather(self.unique, segments));
+    }
+
+    /// The sender answers a panic in `f` itself, so it is taken out first and `Drop` has
+    /// nothing left to do.
+    pub(crate) fn send_fill<F>(mut self, max_len: usize, f: F)
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        assert!(self.sender.is_some());
+        let sender = self.sender.take().unwrap();
+        log_send(sender.fill(self.unique, max_len, f));
     }
 
     /// Reply to a request with the given error code
@@ -207,6 +457,129 @@ impl ReplyData {
     /// Reply to a request with the given data
     pub fn data(self, data: &[u8]) {
         self.reply.send_ll(&ll::ResponseSlice(data));
+    }
+
+    /// Reply to a request with data produced directly into the transport's reply buffer.
+    ///
+    /// `f` receives a zeroed buffer of exactly `max_len` bytes and returns how many bytes it
+    /// filled, which is the length of the reply, or an error to reply with instead. Pass the
+    /// `size` of the request as `max_len`: the kernel never asks for more than the negotiated
+    /// `max_write`, which every transport can hold, whereas a `max_len` the transport cannot
+    /// hold is a caller bug answered with `EINVAL` without running `f`. `f` may also be
+    /// skipped once the connection has ended, when nothing is sent, as with `data()`. When `f`
+    /// does run the request gets exactly one reply: the bytes it reports, its error, `EINVAL`
+    /// for a count larger than `max_len` (or than a reply can carry), or `EIO` if it panics.
+    ///
+    /// Over io_uring the buffer is normally the ring entry's own, so the data is not copied
+    /// again on its way to the kernel; over `/dev/fuse` it is a heap buffer sent with
+    /// `writev(2)`, and the call behaves like `data()`.
+    ///
+    /// # Examples
+    ///
+    /// Serving a `read` request from a file without an intermediate buffer. A short count
+    /// means end of file to the kernel, which is right for a regular file; a source that may
+    /// return short reads before its end should loop until the buffer is full:
+    ///
+    /// ```
+    /// use std::fs::File;
+    /// use std::os::unix::fs::FileExt;
+    ///
+    /// use fuser::Errno;
+    /// use fuser::ReplyData;
+    ///
+    /// fn read(file: &File, offset: u64, size: u32, reply: ReplyData) {
+    ///     reply.fill(size as usize, |buf| {
+    ///         file.read_at(buf, offset).map_err(Errno::from)
+    ///     });
+    /// }
+    /// ```
+    pub fn fill<F>(self, max_len: usize, f: F)
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        self.reply.send_fill(max_len, f);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): reply with data that is already
+    /// several borrowed segments, without joining them first.
+    ///
+    /// The reply is the concatenation of `segments`, in order. Over the
+    /// io_uring transport they are written straight into the ring entry's
+    /// payload buffer (one copy, no syscall); over `/dev/fuse` they go out
+    /// as one `writev(2)`, with no copy at all — strictly less work than
+    /// concatenating them and calling [`Self::data`].
+    ///
+    /// This is the read path of a filesystem whose bytes live in a list of
+    /// reference-counted buffers rather than one slice (Constellation's
+    /// `ReadData`, a `SmallVec<[Bytes; 4]>`). Up to four segments are
+    /// handled without allocating.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fuser::ReplyData;
+    ///
+    /// fn read(chunks: &[Vec<u8>], reply: ReplyData) {
+    ///     reply.gather(chunks);
+    /// }
+    /// ```
+    pub fn gather<B: AsRef<[u8]>>(self, segments: &[B]) {
+        self.reply.send_gather(segments);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the transport this reply goes out over --
+    /// [`crate::Transport::Uring`] when the request came over an io_uring entry, whose payload
+    /// buffer [`Self::fill`] and [`Self::gather`] write in place,
+    /// [`crate::Transport::UringZeroCopy`] when the session's queues are all zero-copy queues
+    /// (plan 38 Z4; whether *this* request was zero-copied is [`Self::zero_copy`]), and
+    /// [`crate::Transport::DevFuse`] otherwise.
+    pub fn transport(&self) -> crate::Transport {
+        self.reply.transport()
+    }
+
+    /// CONSTELLATION PATCH (io-uring): whether this request's pages are registered for a
+    /// `READ_FIXED`: a read of a file opened with [`ReplyOpen::opened_zero_copy`] that the
+    /// kernel queued on a zero-copy queue (plan 38 Z4). [`Self::read_fixed`] then moves the
+    /// data from the file to the reader with no copy by this process; any other reply to it
+    /// is bounced through a memfd into those pages, one copy more than over a ring without
+    /// zero-copy. `false` over `/dev/fuse` and on any other request.
+    pub fn zero_copy(&self) -> bool {
+        self.reply.zero_copied()
+    }
+
+    /// CONSTELLATION PATCH (io-uring): reply with `len` bytes of the file `src`, from `offset`
+    /// (plan 38 §3(d), Z4).
+    ///
+    /// On a zero-copied request ([`Self::zero_copy`]) the ring's thread issues one
+    /// `IORING_OP_READ_FIXED` from `src` into the pages the kernel registered for the request
+    /// -- the reader's page cache, or its own buffer under `O_DIRECT` -- and commits the reply
+    /// once the read completed: the bytes it read, fewer at the end of the file, or its error.
+    /// No byte passes through this process. Anywhere else the bytes are read with `pread(2)`
+    /// into the transport's reply buffer, as [`Self::fill`] would be with a closure doing the
+    /// same: the ring entry's payload buffer, or a heap buffer sent with `writev(2)` over
+    /// `/dev/fuse`. Either way the request gets exactly one reply, and `src` stays open (it is
+    /// owned here) until the read is done, on whatever thread finishes it.
+    ///
+    /// Callable from any thread, like [`Self::fill`]. Pass the request's `size` as `len`, at
+    /// most what `max_write` allows. A `len` the reply buffer cannot hold is answered `EINVAL`
+    /// where the bytes go through one; on a zero-copied request a `len` past the request's
+    /// registered pages is the kernel's to refuse, and the reply is `READ_FIXED`'s error,
+    /// `EFAULT`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::File;
+    /// use std::sync::Arc;
+    ///
+    /// use fuser::ReplyData;
+    ///
+    /// fn read(file: &Arc<File>, offset: u64, size: u32, reply: ReplyData) {
+    ///     reply.read_fixed(Arc::clone(file), offset, size as usize);
+    /// }
+    /// ```
+    pub fn read_fixed(self, src: impl AsFd + Send + 'static, offset: u64, len: usize) {
+        self.reply.send_read_fixed(Box::new(src), offset, len);
     }
 
     /// Reply to a request with the given error code
@@ -387,6 +760,25 @@ impl ReplyOpen {
     pub unsafe fn wrap_backing(&self, id: u32) -> BackingId {
         // TODO: assert passthrough capability is enabled.
         unsafe { self.reply.sender.as_ref().unwrap().wrap_backing(id) }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): reply to an open with `FOPEN_IO_URING_ZERO_COPY` set
+    /// (plan 38 Z4): the kernel registers the pages of every read of this open that it queues
+    /// on a zero-copy io_uring queue ([`crate::Transport::UringZeroCopy`]) for the reply to fill
+    /// with [`ReplyData::read_fixed`]. Elsewhere -- `/dev/fuse`, a ring without zero-copy --
+    /// the flag is ignored and the open behaves as with [`Self::opened`].
+    ///
+    /// Only for opens that cannot write (`O_RDONLY`): the kernel zero-copies the writes of
+    /// such an open too, and this crate cannot hand a zero-copied write's data to
+    /// [`crate::Filesystem::write`] -- it answers one `EIO`.
+    ///
+    /// # Panics
+    /// When `flags` asks for kernel passthrough.
+    pub fn opened_zero_copy(self, fh: ll::FileHandle, flags: FopenFlags) {
+        assert!(!flags.contains(FopenFlags::FOPEN_PASSTHROUGH));
+        let flags = flags | FopenFlags::FOPEN_IO_URING_ZERO_COPY;
+        self.reply
+            .send_ll(&ll::ResponseStruct::new_open(fh, flags, 0));
     }
 
     /// Reply to a request with an opened backing id. Call [`ReplyOpen::open_backing()`]
@@ -951,6 +1343,109 @@ mod test {
         reply.data(&[0xde, 0xad, 0xbe, 0xef]);
     }
 
+    /// Runs `fill` against a `Capture` sender and returns the one reply it sent
+    fn filled<F>(max_len: usize, f: F) -> Vec<u8>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), ReplySender::Capture(tx));
+        reply.fill(max_len, f);
+        let sent = rx.try_recv().expect("no reply was sent");
+        assert!(rx.try_recv().is_err(), "a second reply was sent");
+        sent
+    }
+
+    /// CONSTELLATION PATCH (io-uring)
+    fn gathered<B: AsRef<[u8]>>(segments: &[B]) -> Vec<u8> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), ReplySender::Capture(tx));
+        reply.gather(segments);
+        let sent = rx.try_recv().expect("no reply was sent");
+        assert!(rx.try_recv().is_err(), "a second reply was sent");
+        sent
+    }
+
+    fn data_reply(payload: &[u8]) -> Vec<u8> {
+        let mut expected = vec![
+            0x10 + payload.len() as u8,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        expected.extend_from_slice(&[0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00]);
+        expected.extend_from_slice(payload);
+        expected
+    }
+
+    fn errno_reply(errno: i32) -> Vec<u8> {
+        let mut expected = vec![0x10, 0x00, 0x00, 0x00];
+        expected.extend_from_slice(&(-errno).to_ne_bytes());
+        expected.extend_from_slice(&[0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00]);
+        expected
+    }
+
+    /// The same wire bytes as `data`, from a closure that fills the whole zeroed buffer
+    #[test]
+    fn reply_fill() {
+        let sent = filled(4, |buf| {
+            assert_eq!(buf, [0, 0, 0, 0]);
+            buf.copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+            Ok(buf.len())
+        });
+        assert_eq!(sent, data_reply(&[0xde, 0xad, 0xbe, 0xef]));
+    }
+
+    /// Bytes the closure reported but did not write go out as zeros
+    #[test]
+    fn reply_fill_sends_the_count() {
+        let sent = filled(8, |buf| {
+            assert_eq!(buf.len(), 8);
+            buf[..2].copy_from_slice(&[0xde, 0xad]);
+            buf[2..].copy_from_slice(&[0xff; 6]);
+            Ok(2)
+        });
+        assert_eq!(sent, data_reply(&[0xde, 0xad]));
+        let sent = filled(4, |buf| {
+            buf[0] = 1;
+            Ok(4)
+        });
+        assert_eq!(sent, data_reply(&[1, 0, 0, 0]));
+    }
+
+    #[test]
+    fn reply_fill_rejects_a_count_beyond_the_buffer() {
+        let sent = filled(4, |buf| {
+            buf.fill(0xaa);
+            Ok(5)
+        });
+        assert_eq!(sent, errno_reply(libc::EINVAL));
+    }
+
+    #[test]
+    fn reply_fill_error() {
+        assert_eq!(filled(4, |_| Err(Errno::ENOENT)), errno_reply(libc::ENOENT));
+    }
+
+    #[test]
+    fn reply_fill_panic_replies_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), ReplySender::Capture(tx));
+        let result = thread::spawn(move || {
+            reply.fill(4, |_| -> Result<usize, Errno> {
+                panic!("deliberate panic in fill")
+            });
+        })
+        .join();
+        assert!(result.is_err());
+        assert_eq!(rx.try_recv().unwrap(), errno_reply(libc::EIO));
+        assert!(rx.try_recv().is_err(), "a second reply was sent");
+    }
+
     #[test]
     fn reply_entry() {
         let mut expected = if cfg!(target_os = "macos") {
@@ -1266,5 +1761,24 @@ mod test {
             reply.ok();
         });
         rx.recv().unwrap();
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a gathered reply is byte for byte
+    /// the reply `data()` would have sent for the joined segments, whatever
+    /// the segment count -- including none, and including more than the
+    /// four a `ReadData` holds inline.
+    #[test]
+    fn gather_sends_the_segments_joined() {
+        assert_eq!(gathered::<&[u8]>(&[]), data_reply(b""));
+        assert_eq!(gathered(&[b"hello".as_slice()]), data_reply(b"hello"));
+        assert_eq!(
+            gathered(&[b"hel".as_slice(), b"", b"lo wor", b"ld"]),
+            data_reply(b"hello world")
+        );
+        let owned: Vec<Vec<u8>> = (0..7u8).map(|i| vec![i; 3]).collect();
+        let joined: Vec<u8> = owned.iter().flatten().copied().collect();
+        assert_eq!(gathered(&owned), data_reply(&joined));
+        // Empty segments carry no iovec of their own but must not be lost
+        assert_eq!(gathered(&[b"".as_slice(), b"x"]), data_reply(b"x"));
     }
 }

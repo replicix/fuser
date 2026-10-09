@@ -40,6 +40,10 @@ tokio = { version = "1.48.0", features = ["rt", "rt-multi-thread"], optional = t
 zerocopy = { version = "0.8", features = ["derive"] }
 nix = { version = "0.31.0", features = ["fs", "user", "poll", "socket", "uio", "mount", "process", "ioctl"] }
 
+# The io-uring crate does not build on macOS, which `--all-features` reaches.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7.14", optional = true }
+
 [dev-dependencies]
 env_logger = "0.11.7"
 clap = { version = "4.4", features = ["cargo", "derive"] }
@@ -54,6 +58,11 @@ pkg-config = "0.3.14"
 [features]
 default = []
 experimental = ["async-trait", "tokio"]
+# The FUSE-over-io_uring transport (Linux 6.14+), off by default.
+# `io-uring` itself is a Linux-only dependency, so the feature on another
+# target builds the crate without the transport, which `Session::new` then
+# refuses at runtime.
+io-uring = ["dep:io-uring", "nix/mman", "nix/event", "nix/feature"]
 libfuse = []
 libfuse2 = ["libfuse"]
 libfuse3 = ["libfuse"]
