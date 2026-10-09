@@ -75,6 +75,11 @@ pub use crate::reply::ReplyWrite;
 pub use crate::reply::ReplyXattr;
 pub use crate::request_param::Request;
 pub use crate::session::BackgroundSession;
+// CONSTELLATION PATCH (negotiated-init, detach, from-fd-resumed).
+pub use crate::session::DetachedSession;
+pub use crate::session::NegotiatedInit;
+pub use crate::session::SessionDetacher;
+pub use crate::session::SessionEnd;
 use crate::session::MAX_WRITE_SIZE;
 pub use crate::session::Session;
 pub use crate::session::SessionACL;

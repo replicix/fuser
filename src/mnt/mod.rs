@@ -143,6 +143,14 @@ impl Mount {
         }
     }
 
+    /// CONSTELLATION PATCH (detach): give the mount up without unmounting
+    /// it (a detached session's connection stays mounted for whoever
+    /// serves it next). Not for an `auto_unmount` mount, whose helper
+    /// unmounts once its socket closes (`Session::detacher` refuses one).
+    pub(crate) fn disarm(mut self) {
+        let _ = self.mount_impl.take();
+    }
+
     pub(crate) fn umount(mut self) -> io::Result<()> {
         match self.mount_impl.take() {
             Some(mut mount) => {

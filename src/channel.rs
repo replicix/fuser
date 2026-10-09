@@ -47,6 +47,54 @@ impl Channel {
         }
     }
 
+    /// CONSTELLATION PATCH (detach): make reads on this descriptor return
+    /// `EAGAIN` when no request is pending (an armed session polls first).
+    pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
+        use nix::fcntl::FcntlArg;
+        use nix::fcntl::OFlag;
+        use nix::fcntl::fcntl;
+        let flags = OFlag::from_bits_retain(fcntl(&self.0, FcntlArg::F_GETFL)?);
+        fcntl(&self.0, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(())
+    }
+
+    /// CONSTELLATION PATCH (detach): [`Self::receive_retrying`] on a
+    /// non-blocking descriptor that also returns `Ok(None)` once `stop`
+    /// is set: `stop` is checked before every read, and `wake` (readable
+    /// once a stop is requested) is polled beside the descriptor, so a
+    /// loop waiting for a request returns at once.
+    pub(crate) fn receive_or_wake(
+        &self,
+        buffer: &mut [u8],
+        wake: BorrowedFd<'_>,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> nix::Result<Option<usize>> {
+        use nix::poll::PollFd;
+        use nix::poll::PollFlags;
+        use nix::poll::PollTimeout;
+        use nix::poll::poll;
+        loop {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
+            match self.receive(buffer) {
+                Ok(size) => return Ok(Some(size)),
+                Err(Errno::EAGAIN) => {
+                    let mut fds = [
+                        PollFd::new(self.0.as_fd(), PollFlags::POLLIN),
+                        PollFd::new(wake, PollFlags::POLLIN),
+                    ];
+                    match poll(&mut fds, PollTimeout::NONE) {
+                        Ok(_) | Err(Errno::EINTR) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(Errno::ENOENT | Errno::EINTR) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// Returns a sender object for this channel. The sender object can be
     /// used to send to the channel. Multiple sender objects can be used
     /// and they can safely be sent to other threads.

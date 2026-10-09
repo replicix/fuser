@@ -13,6 +13,8 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 use std::thread::{self};
 
@@ -139,6 +141,173 @@ pub struct Session<FS: Filesystem> {
     /// The field is set to `Some` when the init message is received.
     pub(crate) proto_version: Option<Version>,
     pub(crate) config: Config,
+    /// CONSTELLATION PATCH (negotiated-init): what `FUSE_INIT` agreed,
+    /// set by the handshake or given to [`Session::from_fd_resumed`].
+    negotiated: Option<NegotiatedInit>,
+    /// CONSTELLATION PATCH (detach): armed by [`Session::detacher`].
+    detach: Option<Arc<DetachSignal>>,
+}
+
+/// CONSTELLATION PATCH (negotiated-init): the `FUSE_INIT` parameters a
+/// session agreed with the kernel, recorded by the handshake
+/// ([`Session::negotiated_init`]) so that another process can serve the
+/// same connection without a second handshake the kernel will never ask
+/// for ([`Session::from_fd_resumed`]).
+///
+/// fuser frames every reply and notification by its compiled ABI, not by
+/// the negotiated minor, so resuming needs no per-version state; the
+/// record is what the resuming side checks it is compatible with
+/// ([`NegotiatedInit::check_resumable`]) and what its filesystem learns
+/// the agreed capabilities from, since `Filesystem::init` is not called
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serializable", derive(serde::Serialize, serde::Deserialize))]
+pub struct NegotiatedInit {
+    /// The protocol version the kernel's `FUSE_INIT` announced.
+    pub kernel_major: u32,
+    pub kernel_minor: u32,
+    /// The protocol version this side answered with.
+    pub proto_major: u32,
+    pub proto_minor: u32,
+    /// The capabilities the kernel offered (`InitFlags` bits).
+    pub kernel_flags: u64,
+    /// The capabilities in force: requested by the filesystem and offered
+    /// by the kernel (`InitFlags` bits, `FUSE_INIT_EXT` included).
+    pub flags: u64,
+    pub max_readahead: u32,
+    /// The largest write the kernel sends: the resuming side's request
+    /// buffer must hold it.
+    pub max_write: u32,
+    pub max_background: u16,
+    pub congestion_threshold: u16,
+    pub time_gran_ns: u32,
+    pub max_pages: u16,
+    pub max_stack_depth: u32,
+}
+
+impl NegotiatedInit {
+    /// Whether this build can serve a connection negotiated as `self`:
+    /// the same major version, no capability it does not know, and a
+    /// request buffer that holds the largest write the kernel will send.
+    pub fn check_resumable(&self) -> io::Result<()> {
+        let refuse = |why: String| Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        if self.proto_major != abi::FUSE_KERNEL_VERSION {
+            return refuse(format!(
+                "the connection was negotiated as FUSE {}.{}, this build speaks major {}",
+                self.proto_major,
+                self.proto_minor,
+                abi::FUSE_KERNEL_VERSION
+            ));
+        }
+        let unknown = self.flags & !InitFlags::all().bits();
+        if unknown != 0 {
+            return refuse(format!(
+                "the connection agreed capabilities this build does not know: {unknown:#x}"
+            ));
+        }
+        if self.max_write as usize > MAX_WRITE_SIZE {
+            return refuse(format!(
+                "the connection's max_write {} exceeds this build's request buffer {MAX_WRITE_SIZE}",
+                self.max_write
+            ));
+        }
+        Ok(())
+    }
+
+    /// The capabilities in force.
+    pub fn flags(&self) -> InitFlags {
+        InitFlags::from_bits_retain(self.flags)
+    }
+}
+
+/// CONSTELLATION PATCH (detach): how [`SessionDetacher::detach`] reaches
+/// the event loops. A thread blocked in `read(2)` on `/dev/fuse` cannot be
+/// woken without a request arriving, so an armed session reads its
+/// (non-blocking) descriptors only when `poll(2)` says a request is
+/// pending, and polls this pipe beside them: writing a byte makes every
+/// loop return. The flag is checked before every read, so a request that
+/// was read is always dispatched and answered, and one that was not stays
+/// queued in the kernel for whoever serves the descriptor next.
+#[derive(Debug)]
+pub(crate) struct DetachSignal {
+    stop: AtomicBool,
+    wake_read: OwnedFd,
+    wake_write: OwnedFd,
+}
+
+impl DetachSignal {
+    fn new() -> io::Result<Self> {
+        use nix::fcntl::FcntlArg;
+        use nix::fcntl::FdFlag;
+        use nix::fcntl::fcntl;
+        let (wake_read, wake_write) = nix::unistd::pipe()?;
+        for fd in [&wake_read, &wake_write] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        }
+        Ok(Self {
+            stop: AtomicBool::new(false),
+            wake_read,
+            wake_write,
+        })
+    }
+
+    fn request(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Never read: the pipe stays readable, so every loop's poll
+        // returns, now and on any later pass.
+        let _ = nix::unistd::write(&self.wake_write, &[1u8]);
+    }
+
+    fn requested(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+}
+
+/// CONSTELLATION PATCH (detach): stops an armed session's event loops
+/// from another thread without unmounting and without closing the
+/// connection ([`Session::detacher`], [`Session::run_detachable`]).
+#[derive(Debug, Clone)]
+pub struct SessionDetacher(Arc<DetachSignal>);
+
+impl SessionDetacher {
+    /// Ask every event loop to stop before its next read. Loops finish
+    /// the request they are dispatching first; `run_detachable` returns
+    /// once all have stopped.
+    pub fn detach(&self) {
+        self.0.request();
+    }
+
+    /// Whether [`Self::detach`] was called.
+    pub fn is_detaching(&self) -> bool {
+        self.0.requested()
+    }
+}
+
+/// CONSTELLATION PATCH (detach): how [`Session::run_detachable`] ended.
+#[derive(Debug)]
+pub enum SessionEnd<FS> {
+    /// The connection ended (an unmount, `FUSE_DESTROY`, an abort): the
+    /// filesystem was destroyed, as [`Session::run`] does.
+    Ended,
+    /// Detached: every request read was answered, and the connection is
+    /// still mounted and open.
+    Detached(DetachedSession<FS>),
+}
+
+/// CONSTELLATION PATCH (detach): a session stopped by
+/// [`SessionDetacher::detach`]. The kernel queues requests for the
+/// connection until something reads `fd` again: this process (a new
+/// [`Session::from_fd_resumed`]) or another one it hands `fd` to.
+#[derive(Debug)]
+pub struct DetachedSession<FS> {
+    /// The filesystem, not destroyed.
+    pub filesystem: FS,
+    /// A duplicate of the session's `/dev/fuse` descriptor (the same open
+    /// file, so the same connection and request queues). Non-blocking,
+    /// and close-on-exec as every descriptor fuser opens.
+    pub fd: OwnedFd,
+    /// What `FUSE_INIT` agreed.
+    pub init: NegotiatedInit,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -186,6 +355,8 @@ impl<FS: Filesystem> Session<FS> {
             session_owner: geteuid(),
             proto_version: None,
             config: options.clone(),
+            negotiated: None,
+            detach: None,
         };
 
         session.handshake()?;
@@ -214,11 +385,78 @@ impl<FS: Filesystem> Session<FS> {
             session_owner: geteuid(),
             proto_version: None,
             config,
+            negotiated: None,
+            detach: None,
         };
 
         session.handshake()?;
 
         Ok(session)
+    }
+
+    /// CONSTELLATION PATCH (from-fd-resumed): serve a `/dev/fuse`
+    /// descriptor whose `FUSE_INIT` was already answered — by another
+    /// session, in this process or another — without a handshake: the
+    /// kernel sends `FUSE_INIT` once per connection, so the first request
+    /// on such a descriptor is an ordinary one, which [`Session::from_fd`]
+    /// would refuse. `init` is what that handshake agreed
+    /// ([`Session::negotiated_init`], [`DetachedSession::init`]).
+    /// `Filesystem::init` is not called: the filesystem is already
+    /// initialised for this connection as far as the kernel knows.
+    pub fn from_fd_resumed(
+        filesystem: FS,
+        fd: OwnedFd,
+        acl: SessionACL,
+        config: Config,
+        init: NegotiatedInit,
+    ) -> io::Result<Self> {
+        init.check_resumable()?;
+        let ch = Channel::new(Arc::new(DevFuse(File::from(fd))));
+        Ok(Session {
+            filesystem: FilesystemHolder {
+                fs: Some(filesystem),
+            },
+            ch,
+            mount: UmountOnDrop {
+                mount: Arc::new(Mutex::new(None)),
+            },
+            allowed: acl,
+            session_owner: geteuid(),
+            proto_version: Some(Version(init.kernel_major, init.kernel_minor)),
+            config,
+            negotiated: Some(init),
+            detach: None,
+        })
+    }
+
+    /// CONSTELLATION PATCH (negotiated-init): what `FUSE_INIT` agreed.
+    pub fn negotiated_init(&self) -> Option<NegotiatedInit> {
+        self.negotiated
+    }
+
+    /// CONSTELLATION PATCH (detach): arm this session for
+    /// [`SessionDetacher::detach`] (call before running it). Refused for
+    /// an `auto_unmount` mount, whose unmount is tied to this process.
+    pub fn detacher(&mut self) -> io::Result<SessionDetacher> {
+        if self
+            .config
+            .mount_options
+            .contains(&MountOption::AutoUnmount)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an auto_unmount session cannot be detached",
+            ));
+        }
+        let signal = match &self.detach {
+            Some(signal) => signal.clone(),
+            None => {
+                let signal = Arc::new(DetachSignal::new()?);
+                self.detach = Some(signal.clone());
+                signal
+            }
+        };
+        Ok(SessionDetacher(signal))
     }
 
     /// Run the session loop in a background thread. If the returned handle is dropped,
@@ -244,15 +482,28 @@ impl<FS: Filesystem> Session<FS> {
     /// # Errors
     /// Returns any final error when the session comes to an end.
     pub fn run(self) -> io::Result<()> {
+        // CONSTELLATION PATCH (detach): the loop is `run_detachable`'s; a
+        // detached session is dropped here (its descriptor closes).
+        self.run_detachable().map(|_| ())
+    }
+
+    /// CONSTELLATION PATCH (detach): [`Session::run`], which an armed
+    /// session ([`Session::detacher`]) may also leave detached: then the
+    /// filesystem is not destroyed, the mount is not unmounted, and the
+    /// descriptor comes back open ([`SessionEnd::Detached`]).
+    pub fn run_detachable(self) -> io::Result<SessionEnd<FS>> {
         let Session {
             filesystem,
             ch,
-            mount: _do_not_umount_yet,
+            mount: do_not_umount_yet,
             allowed,
             session_owner,
             proto_version: _,
             config,
+            negotiated,
+            detach,
         } = self;
+        let master = ch.clone();
 
         let n_threads = config.n_threads.unwrap_or(1);
 
@@ -292,12 +543,16 @@ impl<FS: Filesystem> Session<FS> {
 
         for (i, ch) in channels.into_iter().enumerate() {
             let thread_name = format!("fuser-{i}");
+            if detach.is_some() {
+                ch.set_nonblocking()?;
+            }
             let event_loop = SessionEventLoop {
                 thread_name: thread_name.clone(),
                 filesystem: filesystem.clone(),
                 ch,
                 allowed,
                 session_owner,
+                detach: detach.clone(),
             };
             threads.push(
                 thread::Builder::new()
@@ -307,6 +562,9 @@ impl<FS: Filesystem> Session<FS> {
         }
 
         let mut reply: io::Result<()> = Ok(());
+        // CONSTELLATION PATCH (detach): whether every loop stopped for a
+        // detach (none saw the connection end).
+        let mut all_stopped = true;
         for thread in threads {
             let res = match thread.join() {
                 Ok(res) => res,
@@ -314,9 +572,14 @@ impl<FS: Filesystem> Session<FS> {
                     return Err(io::Error::other("event loop thread panicked"));
                 }
             };
-            if let Err(e) = res {
-                if reply.is_ok() {
-                    reply = Err(e);
+            match res {
+                Ok(LoopEnd::Stopped) => {}
+                Ok(LoopEnd::Ended) => all_stopped = false,
+                Err(e) => {
+                    all_stopped = false;
+                    if reply.is_ok() {
+                        reply = Err(e);
+                    }
                 }
             }
         }
@@ -327,9 +590,28 @@ impl<FS: Filesystem> Session<FS> {
             ));
         };
 
+        // CONSTELLATION PATCH (detach): hand the connection back instead
+        // of ending it.
+        if all_stopped && detach.as_ref().is_some_and(|d| d.requested()) {
+            let init = negotiated
+                .ok_or_else(|| io::Error::other("BUG: a detached session never negotiated"))?;
+            let fd = master.as_fd().try_clone_to_owned()?;
+            if let Some(mount) = do_not_umount_yet.mount.lock().take() {
+                mount.disarm();
+            }
+            let Some(fs) = filesystem.fs.take() else {
+                return Err(io::Error::other("BUG: the filesystem was destroyed"));
+            };
+            return Ok(SessionEnd::Detached(DetachedSession {
+                filesystem: fs,
+                fd,
+                init,
+            }));
+        }
+
         filesystem.destroy();
 
-        reply
+        reply.map(|()| SessionEnd::Ended)
     }
 
     fn handshake(&mut self) -> io::Result<()> {
@@ -470,6 +752,28 @@ impl<FS: Filesystem> Session<FS> {
             );
 
             let response = init.reply(&config);
+            // CONSTELLATION PATCH (negotiated-init): what this reply
+            // agrees to, as `Init::reply` computes it.
+            let agreed = (config.requested | InitFlags::FUSE_INIT_EXT) & init.capabilities();
+            self.negotiated = Some(NegotiatedInit {
+                kernel_major: v.0,
+                kernel_minor: v.1,
+                proto_major: abi::FUSE_KERNEL_VERSION,
+                proto_minor: abi::FUSE_KERNEL_MINOR_VERSION,
+                kernel_flags: init.capabilities().bits(),
+                flags: agreed.bits(),
+                max_readahead: config.max_readahead,
+                max_write: config.max_write,
+                max_background: config.max_background,
+                congestion_threshold: config.congestion_threshold(),
+                time_gran_ns: config.time_gran.as_nanos() as u32,
+                max_pages: config.max_pages(),
+                max_stack_depth: if agreed.contains(InitFlags::FUSE_PASSTHROUGH) {
+                    config.max_stack_depth
+                } else {
+                    0
+                },
+            });
             <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
                 .send_ll(&response);
 
@@ -518,10 +822,20 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) filesystem: Arc<FilesystemHolder<FS>>,
     pub(crate) allowed: SessionACL,
     pub(crate) session_owner: Uid,
+    /// CONSTELLATION PATCH (detach): `Some` for an armed session.
+    pub(crate) detach: Option<Arc<DetachSignal>>,
+}
+
+/// CONSTELLATION PATCH (detach): why an event loop returned.
+enum LoopEnd {
+    /// The connection ended.
+    Ended,
+    /// A detach was requested.
+    Stopped,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
-    fn event_loop(&self) -> io::Result<()> {
+    fn event_loop(&self) -> io::Result<LoopEnd> {
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buf = FuseReadBuf::new();
@@ -529,13 +843,22 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive_retrying(buf) {
-                Ok(size) => match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
+            // CONSTELLATION PATCH (detach): an armed session reads only
+            // when a request is pending or the detach pipe says stop.
+            let received = match &self.detach {
+                None => self.ch.receive_retrying(buf).map(Some),
+                Some(d) => self
+                    .ch
+                    .receive_or_wake(buf, d.wake_read.as_fd(), &d.stop),
+            };
+            match received {
+                Ok(None) => return Ok(LoopEnd::Stopped),
+                Ok(Some(size)) => match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
                     Some(req) => {
                         if let Ok(Operation::Destroy(_)) = req.request.operation() {
                             req.reply::<ReplyEmpty>().ok();
-                            return Ok(());
+                            return Ok(LoopEnd::Ended);
                         } else {
                             req.dispatch(self)
                         }
@@ -548,7 +871,7 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                         ));
                     }
                 },
-                Err(nix::errno::Errno::ENODEV) => return Ok(()),
+                Err(nix::errno::Errno::ENODEV) => return Ok(LoopEnd::Ended),
                 Err(err) => return Err(err.into()),
             }
         }
