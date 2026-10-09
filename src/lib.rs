@@ -49,6 +49,8 @@ pub use crate::ll::request::LockOwner;
 pub use crate::ll::request::Version;
 pub use crate::mnt::mount_options::Config;
 pub use crate::mnt::mount_options::MountOption;
+// CONSTELLATION PATCH (io-uring): which requests a ring thread dispatches itself.
+pub use crate::mnt::mount_options::RingDispatch;
 pub use crate::notify::Notifier;
 pub use crate::notify::PollHandle;
 pub use crate::notify::PollNotifier;
