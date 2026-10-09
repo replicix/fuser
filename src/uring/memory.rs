@@ -1,5 +1,5 @@
 //! CONSTELLATION PATCH (io-uring): this whole file is Constellation's, not upstream
-//! fuser's (vendor/fuser/CONSTELLATION-PATCH.md, patches/0002-io-uring-transport.patch).
+//! fuser's (REPLICIX.md, branch io-uring; rationale in replicix/PATCHES.md).
 //!
 //! An in-memory stand-in for the kernel's half of FUSE-over-io_uring, so that a test can drive
 //! a whole ring session -- `Session`, its ring threads, the entry state machine, the commit
