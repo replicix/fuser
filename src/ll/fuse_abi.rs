@@ -769,7 +769,7 @@ pub(crate) const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
 /// Commands carried in `io_uring_sqe.cmd_op` for `IORING_OP_URING_CMD` on `/dev/fuse`.
 /// Since ABI 7.42; `ADD_QUEUE` and `ADD_BUFPOOL` since 7.46 (kernel 7.3, CONSTELLATION PATCH
 /// (io-uring), plan 38 Z4: re-verified against the running kernel's uapi header,
-/// vendor/fuser/CONSTELLATION-PATCH.md "Zero-copy").
+/// replicix/PATCHES.md "Zero-copy").
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
 #[allow(non_camel_case_types)]

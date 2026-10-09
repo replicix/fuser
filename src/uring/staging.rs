@@ -1,5 +1,5 @@
 //! CONSTELLATION PATCH (io-uring): this whole file is Constellation's, not upstream
-//! fuser's (vendor/fuser/CONSTELLATION-PATCH.md, patches/0002-io-uring-transport.patch).
+//! fuser's (REPLICIX.md, branch io-uring; rationale in replicix/PATCHES.md).
 //!
 //! Turns a fetched entry into the contiguous request bytes the `/dev/fuse` parser expects.
 //!
