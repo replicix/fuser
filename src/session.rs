@@ -1196,6 +1196,8 @@ struct RingHandler<FS: Filesystem> {
     /// CONSTELLATION PATCH (io-uring): where requests that may block are dispatched instead
     /// of on this thread (`dispatch_on_ring`).
     offload: std::sync::mpsc::Sender<HeldRequest>,
+    /// What this ring dispatches itself (`Config::io_uring_dispatch`).
+    dispatch: crate::RingDispatch,
     /// CONSTELLATION PATCH (io-uring): a callback panicked on an offload thread. The offload
     /// threads serve every ring, so every ring stops entering the filesystem then, as this one
     /// does after a panic of its own (`panicked`).
@@ -1229,10 +1231,20 @@ struct RingHandler<FS: Filesystem> {
 /// filesystem answers later from another thread. That is what bounds blocking lock requests
 /// per queue (`RingCommit::reserve_lock_wait`).
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
-pub(crate) fn dispatch_on_ring(opcode: u32) -> bool {
+pub(crate) fn dispatch_on_ring(opcode: u32, dispatch: crate::RingDispatch) -> bool {
     use crate::ll::fuse_abi::fuse_opcode::*;
+    let opcode = crate::ll::fuse_abi::fuse_opcode::try_from(opcode);
+    if dispatch == crate::RingDispatch::AllButWaits {
+        // An opcode this build does not know is offloaded, whatever the mode
+        return opcode.is_ok_and(|op| {
+            !matches!(
+                op,
+                FUSE_SETLKW | FUSE_FSYNC | FUSE_FSYNCDIR | FUSE_FALLOCATE | FUSE_COPY_FILE_RANGE
+            )
+        });
+    }
     matches!(
-        crate::ll::fuse_abi::fuse_opcode::try_from(opcode),
+        opcode,
         Ok(FUSE_READ
             | FUSE_GETATTR
             | FUSE_READLINK
@@ -1255,7 +1267,7 @@ impl<FS: Filesystem> crate::uring::ring::FetchHandler for RingHandler<FS> {
         let opcode = request
             .get(4..8)
             .map_or(u32::MAX, |b| u32::from_ne_bytes(b.try_into().unwrap()));
-        if request.len() >= 8 && !dispatch_on_ring(opcode) {
+        if request.len() >= 8 && !dispatch_on_ring(opcode, self.dispatch) {
             // The receiving end lives as long as any sender; if the offload threads are gone
             // (spawning them failed part way), the request is served here after all
             let mut held = commit.hold(request);
@@ -1387,6 +1399,7 @@ fn serve_ring<FS: Filesystem>(
             },
             panicked: false,
             offload: offload_tx.clone(),
+            dispatch: config.io_uring_dispatch,
             offload_panicked: offload_panicked.clone(),
         })
     })?;
@@ -1636,6 +1649,27 @@ mod thread_test {
 
     /// Distinct closures have distinct types, so a mixed list needs boxing
     type Body = Box<dyn FnOnce() -> io::Result<()> + Send>;
+
+    #[test]
+    fn ring_dispatch_keeps_waits_off_the_ring_in_every_mode() {
+        use crate::ll::fuse_abi::fuse_opcode::*;
+        use crate::RingDispatch::{AllButWaits, Reads};
+        let on = |op: u32, mode| dispatch_on_ring(op, mode);
+        for op in [FUSE_READ, FUSE_GETATTR, FUSE_STATFS, FUSE_RELEASEDIR] {
+            let op = op as u32;
+            assert!(on(op, Reads) && on(op, AllButWaits), "opcode {op}");
+        }
+        for op in [FUSE_LOOKUP, FUSE_WRITE, FUSE_MKDIR, FUSE_SETLK, FUSE_FLUSH, FUSE_OPENDIR] {
+            let op = op as u32;
+            assert!(!on(op, Reads) && on(op, AllButWaits), "opcode {op}");
+        }
+        for op in [FUSE_SETLKW, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_FALLOCATE, FUSE_COPY_FILE_RANGE] {
+            let op = op as u32;
+            assert!(!on(op, Reads) && !on(op, AllButWaits), "opcode {op}");
+        }
+        assert!(!dispatch_on_ring(u32::MAX, AllButWaits), "an unknown opcode is offloaded");
+        assert_eq!(Config::default().io_uring_dispatch, Reads);
+    }
 
     #[test]
     fn join_all_reports_the_first_error_after_joining_every_thread() {

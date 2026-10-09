@@ -68,6 +68,12 @@ pub struct Config {
     /// (73 per queue on a 448-CPU machine with one ring); a larger product falls back to
     /// `/dev/fuse` with a warning.
     pub io_uring_queue_depth: u32,
+    /// Which requests a ring thread dispatches itself when `io_uring` is set, rather than
+    /// handing them to the session's offload threads (`n_threads` of them). Default
+    /// [`RingDispatch::Reads`]. A ring thread serves its CPUs' queues one request at a time, so
+    /// whatever it dispatches itself must not block for long; every hand-off costs a thread
+    /// wake-up. No effect on `/dev/fuse`.
+    pub io_uring_dispatch: RingDispatch,
     /// CONSTELLATION PATCH (io-uring): try zero-copy queues (plan 38 Z4) when `io_uring` is
     /// set. Default `true`. Tried only when the kernel offers `FUSE_HAS_IO_URING_BUFPOOL`
     /// (7.3+) and the process has `CAP_SYS_ADMIN`; never otherwise. A kernel that refuses the
@@ -129,6 +135,7 @@ impl Default for Config {
             clone_fd: false,
             io_uring: false,
             io_uring_queue_depth: 8,
+            io_uring_dispatch: RingDispatch::Reads,
             io_uring_zero_copy: true,
             io_uring_register_pool: false,
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -139,6 +146,25 @@ impl Default for Config {
             io_uring_lock_wait_downgrades: None,
         }
     }
+}
+
+/// Which requests a ring thread dispatches itself ([`Config::io_uring_dispatch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RingDispatch {
+    /// Reads of data and of metadata a filesystem answers from what it holds: `READ`,
+    /// `GETATTR`, `READLINK`, `GETXATTR`, `LISTXATTR`, `STATFS`, `ACCESS`, `RELEASEDIR`,
+    /// `DESTROY`. Everything else is offloaded. For a filesystem whose other callbacks may wait
+    /// on a remote store, a lease or another node.
+    #[default]
+    Reads,
+    /// Everything but the requests that wait by design or for the disk: `SETLKW`, `FSYNC`,
+    /// `FSYNCDIR`, `FALLOCATE`, `COPY_FILE_RANGE`. For a filesystem over local storage, whose
+    /// callbacks return in microseconds: no thread hop for most requests. A callback that does
+    /// block (a local file system's journal commit can stall unrelated calls for seconds)
+    /// holds up every request queued on that ring until it returns, where a `/dev/fuse`
+    /// session's other readers would carry on.
+    AllButWaits,
 }
 
 /// Mount options accepted by the FUSE filesystem type
