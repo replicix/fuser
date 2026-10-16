@@ -16,6 +16,7 @@ use std::io::Read;
 use std::mem;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
@@ -114,12 +115,22 @@ impl MountImpl {
     }
 }
 
+/// CONSTELLATION PATCH (no-fork): whether fusermount will run this mount
+/// with auto-unmount, decided on the `-o` options it is handed as it parses
+/// them, so a `CUSTOM("auto_unmount")` counts as `AutoUnmount` does.
+fn auto_unmount(options: &[MountOption]) -> bool {
+    options
+        .iter()
+        .map(option_to_string)
+        .any(|o| o.split(',').any(|o| o == "auto_unmount"))
+}
+
 fn fuse_mount_pure(
     mountpoint: &OsStr,
     options: &[MountOption],
     acl: SessionACL,
 ) -> Result<(DevFuse, Option<UnixStream>), io::Error> {
-    if options.contains(&MountOption::AutoUnmount) {
+    if auto_unmount(options) {
         // Auto unmount is only supported via fusermount
         return fuse_mount_fusermount(mountpoint, options, acl);
     }
@@ -278,10 +289,18 @@ fn fuse_mount_fusermount(
     if fusermount_bin.ends_with(MOUNT_FUSEFS_BIN) {
         return fuse_mount_mount_fusefs(&fusermount_bin, mountpoint, options, acl);
     }
+    fuse_mount_with_helper(&fusermount_bin, mountpoint, options, acl)
+}
 
+fn fuse_mount_with_helper(
+    fusermount_bin: &str,
+    mountpoint: &OsStr,
+    options: &[MountOption],
+    acl: SessionACL,
+) -> Result<(DevFuse, Option<UnixStream>), Error> {
     let (child_socket, receive_socket) = UnixStream::pair()?;
 
-    let mut builder = Command::new(&fusermount_bin);
+    let mut builder = Command::new(fusermount_bin);
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut options_strs: Vec<String> = options.iter().map(option_to_string).collect();
     options_strs.extend(acl.to_mount_option().map(|s| s.to_owned()));
@@ -289,18 +308,38 @@ fn fuse_mount_fusermount(
         builder.arg("-o");
         builder.arg(options_strs.join(","));
     }
-    builder
-        .arg("--")
-        .arg(mountpoint)
-        .env(FUSERMOUNT_COMM_ENV, child_socket.as_raw_fd().to_string());
+    builder.arg("--").arg(mountpoint);
 
-    unsafe {
-        clear_cloexec_in_pre_exec(&mut builder, child_socket.as_fd());
+    let mut held = None;
+    if auto_unmount(options) {
+        // fusermount 3.17 and later refuse a socket at 0, 1 or 2 on the
+        // auto-unmount path (`close_inherited_fds`): forked, as before.
+        builder.env(FUSERMOUNT_COMM_ENV, child_socket.as_raw_fd().to_string());
+        unsafe {
+            clear_cloexec_in_pre_exec(&mut builder, child_socket.as_fd());
+        }
+        held = Some(child_socket);
+    } else {
+        // CONSTELLATION PATCH (no-fork): passed as stdin, the socket needs
+        // no pre_exec hook, so the helper is spawned without fork
+        // (posix_spawn). A fork write-protects every private page of the
+        // caller: each first write to one after the mount is a page fault,
+        // thousands on the first requests a server with a large heap
+        // answers. This assumes libfuse's `_FUSE_COMMFD` contract, also
+        // of fuse2's `fusermount`: any fd number, at most checked to be a
+        // socket (2.9-3.14 `atoi` it, 3.15 and later `fstat` it), with fds
+        // 0-2 untouched before the descriptor is sent.
+        builder
+            .env(FUSERMOUNT_COMM_ENV, "0")
+            .stdin(Stdio::from(OwnedFd::from(child_socket)));
     }
 
     let fusermount_child = builder.spawn()?;
 
-    drop(child_socket); // close socket in parent
+    // Close the parent's copy of the helper's end (held by the builder
+    // in the stdin case), so a failed helper leaves the socket at EOF.
+    drop(held);
+    drop(builder);
 
     let file = match receive_fusermount_message(&receive_socket) {
         Ok(f) => f,
@@ -318,7 +357,7 @@ fn fuse_mount_fusermount(
     };
     let mut receive_socket = Some(receive_socket);
 
-    if !options.contains(&MountOption::AutoUnmount) {
+    if !auto_unmount(options) {
         // Only close the socket, if auto unmount is not set.
         // fusermount will keep running until the socket is closed, if auto unmount is set
         drop(mem::take(&mut receive_socket));
@@ -402,7 +441,7 @@ fn fuse_mount_sys(
     let mountpoint_mode = File::open(mountpoint)?.metadata()?.permissions().mode();
 
     // Auto unmount requests must be sent to fusermount binary
-    assert!(!options.contains(&MountOption::AutoUnmount));
+    assert!(!auto_unmount(options));
 
     let file = match DevFuse::open() {
         Ok(dev_fuse) => dev_fuse,
@@ -518,4 +557,71 @@ fn fuse_mount_sys(
     _acl: SessionACL,
 ) -> Result<Option<DevFuse>, Error> {
     Ok(None)
+}
+
+// The stand-in helper relies on /bin/sh, /dev/stdin and /proc/self/fd.
+#[cfg(all(test, target_os = "linux"))]
+mod test {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// `fuse_mount_with_helper` with a stand-in helper that reports on
+    /// stderr where it found the socket, then fails: the mount's error
+    /// carries the report (and a failed helper leaves the socket at EOF).
+    /// It checks the spawn's contract, not that no fork happened: that is
+    /// `strace -f -e trace=clone,clone3` (`CLONE_VM|CLONE_VFORK`). A real
+    /// mount through the setuid fusermount cannot be traced as well, since
+    /// ptrace drops setuid, unless run as root.
+    fn helper_report(options: &[MountOption]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("fusermount3");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\n\
+             if [ \"$_FUSE_COMMFD\" = 0 ] && [ -S /dev/stdin ]; then echo 'socket on stdin' >&2; fi\n\
+             if [ \"$_FUSE_COMMFD\" -gt 2 ] && [ -S /proc/self/fd/$_FUSE_COMMFD ]; then echo 'socket above stdio' >&2; fi\n\
+             exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut tries = 0;
+        loop {
+            match fuse_mount_with_helper(
+                helper.to_str().unwrap(),
+                OsStr::new("/nonexistent"),
+                options,
+                SessionACL::Owner,
+            ) {
+                Ok(_) => panic!("the stand-in helper mounted nothing"),
+                // Another test's fork may hold the script open for writing.
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 10 => tries += 1,
+                Err(e) => return e.to_string(),
+            }
+        }
+    }
+
+    /// CONSTELLATION PATCH (no-fork): the helper of a plain mount gets the
+    /// socket as stdin, so it is spawned with no pre_exec hook (no fork).
+    #[test]
+    fn a_plain_mount_hands_the_helper_its_socket_as_stdin() {
+        let report = helper_report(&[]);
+        assert!(report.contains("socket on stdin"), "{report}");
+    }
+
+    /// The auto-unmount helper, which refuses a socket at 0, 1 or 2 from
+    /// fusermount 3.17 on, gets it under its own number, also when the
+    /// option is spelled as a custom one.
+    #[test]
+    fn an_auto_unmount_helper_gets_its_socket_above_stdio() {
+        for options in [
+            vec![MountOption::AutoUnmount],
+            vec![MountOption::CUSTOM("ro,auto_unmount".to_string())],
+        ] {
+            let report = helper_report(&options);
+            assert!(
+                report.contains("socket above stdio"),
+                "{options:?}: {report}"
+            );
+        }
+    }
 }
