@@ -987,3 +987,52 @@ fails with the unbounded wait) and
 Regenerated as `git diff --no-index --no-prefix a b` of pristine 0.18.0 with
 0001-0003 applied (`a`) against this tree (`b`); `tools/vendor-fuser.sh
 --check` verifies the series.
+
+## Spawning `fusermount3` without `fork` (branch `no-fork`)
+
+Upstream 0.18 hands `fusermount3` its socket through a `pre_exec` hook
+that clears `FD_CLOEXEC`, and a `pre_exec` hook makes the standard library
+`fork`. A fork write-protects every private page of the caller, so after
+the mount its first write to each one is a page fault: a server that
+mounts after it has built a large heap pays thousands of them on its first
+requests. In constellation (a daemon that opens its store, caches and
+pack catalog before it mounts) the first metadata walk after a mount took
+~1700 minor faults, all in `readdir`'s first reads of each directory
+(fjall's memtable, written before the mount), and ran ~21 % slower than
+the same walk with the faults absent.
+
+- A mount without `auto_unmount` passes the socket as the helper's stdin
+  with `_FUSE_COMMFD=0`. Nothing then needs a hook, and the standard
+  library spawns with `posix_spawn` (`CLONE_VM | CLONE_VFORK` under glibc:
+  no page-table copy, nothing write-protected). The contract assumed is
+  libfuse's `_FUSE_COMMFD` protocol as `util/fusermount.c` implements it,
+  which fuse2's `fusermount` (the fallback binary) shares: fusermount 2.9
+  and 3.0-3.14 `atoi()` the value and use it directly; 3.15-3.16 add an
+  `fstat`/`S_ISSOCK` check; 3.17 and master parse it with `strtol` and
+  check `fstat` and `S_ISSOCK`. None checks the number, calls `isatty`, or
+  touches fds 0-2 before `send_fd` on this path, and glibc's setuid start
+  (`__libc_check_standard_fds`) only fills in a closed fd 0-2, never
+  replaces an open one.
+- An `auto_unmount` mount keeps the forked spawn: from 3.17 on libfuse's
+  auto-unmount path (`close_inherited_fds`) refuses a socket at 0, 1 or 2,
+  after the mount is up. 3.16 and older would accept it; the fork is kept
+  for 3.17 and later. Whether a mount is one is decided on the `-o`
+  options as fusermount parses them, so `CUSTOM("auto_unmount")` counts
+  as `AutoUnmount` does (`auto_unmount()`, also used by
+  `fuse_mount_pure` and for keeping the socket after the mount).
+- The parent's copy of the helper's end is closed right after the spawn
+  in both cases (the builder holds it in the stdin case), so a failed
+  helper still leaves the socket at EOF.
+
+Tests (Linux only: the stand-in helper uses `/bin/sh`, `/dev/stdin` and
+`/proc/self/fd`): `mnt::fuse_pure::test::a_plain_mount_hands_the_helper_its_socket_as_stdin`
+(a stand-in helper reports where it found the socket; fails on 0.18, where
+it is not on stdin) and `an_auto_unmount_helper_gets_its_socket_above_stdio`
+(also for `CUSTOM("ro,auto_unmount")`). They check the contract, not the
+absence of a fork: `strace -f -e trace=clone,clone3` shows
+`CLONE_VM|CLONE_VFORK` for the plain spawn and a plain `clone` for the
+auto-unmount one. A successful mount through the setuid fusermount cannot
+be traced at the same time (ptrace drops setuid unless run as root), so the
+spawn flags and a real unprivileged mount (fusermount3 3.14, `hello`
+example: mounted, read, no leaked socket, unmounted) were checked in
+separate runs.
