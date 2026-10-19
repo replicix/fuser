@@ -171,6 +171,15 @@ impl ReplySender {
         }
     }
 
+    /// CONSTELLATION PATCH (io-uring): see [`ReplyEmpty::hold_for_wait`].
+    pub(crate) fn hold_for_wait(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => commit.reserve_lock_wait(),
+            _ => true,
+        }
+    }
+
     /// CONSTELLATION PATCH (io-uring): whether the request's pages are registered for
     /// `READ_FIXED` (plan 38 Z4); see [`ReplyData::zero_copy`].
     pub(crate) fn zero_copied(&self) -> bool {
@@ -348,6 +357,11 @@ impl ReplyRaw {
             .map_or(crate::Transport::DevFuse, ReplySender::transport)
     }
 
+    /// CONSTELLATION PATCH (io-uring): see [`ReplyEmpty::hold_for_wait`].
+    pub(crate) fn hold_for_wait(&self) -> bool {
+        self.sender.as_ref().is_none_or(ReplySender::hold_for_wait)
+    }
+
     /// CONSTELLATION PATCH (io-uring): see [`ReplyData::zero_copy`].
     pub(crate) fn zero_copied(&self) -> bool {
         self.sender.as_ref().is_some_and(ReplySender::zero_copied)
@@ -426,6 +440,22 @@ impl Reply for ReplyEmpty {
 }
 
 impl ReplyEmpty {
+    /// CONSTELLATION PATCH (io-uring): the filesystem has found that this request has to wait
+    /// for something that may take long (a lock request whose lock it cannot grant yet) and
+    /// asks to keep it unanswered: `true` if it may.
+    ///
+    /// Over a ring the request holds its entry until it is answered, and while every entry
+    /// of a queue is held the kernel holds that CPU's further requests back. A queue lends at
+    /// most `depth - 1` entries to requests that wait (`RingCommit::reserve_lock_wait`, the
+    /// budget a `FUSE_SETLKW` is admitted under at dispatch): this takes one, so that one
+    /// entry of every queue stays free for the requests that do not wait. `false`: the budget
+    /// is spent (or this `FUSE_SETLKW` was downgraded for it): the filesystem must answer
+    /// now. Idempotent; over `/dev/fuse`, where a waiting request holds nothing, always
+    /// `true`.
+    pub fn hold_for_wait(&self) -> bool {
+        self.reply.hold_for_wait()
+    }
+
     /// Reply to a request with nothing
     pub fn ok(self) {
         self.reply.send_ll(&ll::ResponseEmpty);
