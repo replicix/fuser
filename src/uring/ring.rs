@@ -1109,8 +1109,19 @@ impl RingCommit {
     /// `/dev/fuse` session has, where a waiting request holds nothing. `false` means the
     /// budget is spent; the caller then serves the request without waiting
     /// (`HeldRequest::downgrade_lock_wait`).
+    ///
+    /// Idempotent, so a filesystem that decides *later* that a request has to wait (a
+    /// `FUSE_SETLK` whose lock cannot be granted yet) may ask too ([`ReplyEmpty::hold_for_wait`]):
+    /// `true` at once for an entry that already counts (a `FUSE_SETLKW` that was admitted), and
+    /// `false` for one that was downgraded because the budget was spent.
     pub(crate) fn reserve_lock_wait(&self) -> bool {
         let e = self.entry();
+        if e.lock_downgraded.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        if e.lock_wait.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         let mut live = self.ring.live.lock();
         let budget = self.ring.depth.saturating_sub(1);
         let Some(n) = live.lock_waits.get_mut(e.queue as usize) else {
