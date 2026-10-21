@@ -484,6 +484,15 @@ impl Reply for ReplyData {
 }
 
 impl ReplyData {
+    /// CONSTELLATION PATCH (io-uring): as [`ReplyEmpty::hold_for_wait`], for a request of
+    /// this kind that the filesystem finds has to wait (a read or write parked behind a lock
+    /// grant whose renewal is pending): one of its queue's `depth - 1` lock-wait entries, or
+    /// `false` when they are spent and the filesystem must answer now. Always `true` over
+    /// `/dev/fuse`.
+    pub fn hold_for_wait(&self) -> bool {
+        self.reply.hold_for_wait()
+    }
+
     /// Reply to a request with the given data
     pub fn data(self, data: &[u8]) {
         self.reply.send_ll(&ll::ResponseSlice(data));
@@ -635,6 +644,15 @@ impl Reply for ReplyEntry {
 }
 
 impl ReplyEntry {
+    /// CONSTELLATION PATCH (io-uring): as [`ReplyEmpty::hold_for_wait`], for a request of
+    /// this kind that the filesystem finds has to wait (a read or write parked behind a lock
+    /// grant whose renewal is pending): one of its queue's `depth - 1` lock-wait entries, or
+    /// `false` when they are spent and the filesystem must answer now. Always `true` over
+    /// `/dev/fuse`.
+    pub fn hold_for_wait(&self) -> bool {
+        self.reply.hold_for_wait()
+    }
+
     /// Reply to a request with the given entry
     pub fn entry(self, ttl: &Duration, attr: &FileAttr, generation: Generation) {
         self.reply.send_ll(&ll::ResponseStruct::new_entry(
@@ -696,6 +714,15 @@ impl Reply for ReplyAttr {
 }
 
 impl ReplyAttr {
+    /// CONSTELLATION PATCH (io-uring): as [`ReplyEmpty::hold_for_wait`], for a request of
+    /// this kind that the filesystem finds has to wait (a read or write parked behind a lock
+    /// grant whose renewal is pending): one of its queue's `depth - 1` lock-wait entries, or
+    /// `false` when they are spent and the filesystem must answer now. Always `true` over
+    /// `/dev/fuse`.
+    pub fn hold_for_wait(&self) -> bool {
+        self.reply.hold_for_wait()
+    }
+
     /// Reply to a request with the given attribute
     pub fn attr(self, ttl: &Duration, attr: &FileAttr) {
         self.reply
@@ -757,6 +784,15 @@ impl Reply for ReplyOpen {
 }
 
 impl ReplyOpen {
+    /// CONSTELLATION PATCH (io-uring): as [`ReplyEmpty::hold_for_wait`], for a request of
+    /// this kind that the filesystem finds has to wait (a read or write parked behind a lock
+    /// grant whose renewal is pending): one of its queue's `depth - 1` lock-wait entries, or
+    /// `false` when they are spent and the filesystem must answer now. Always `true` over
+    /// `/dev/fuse`.
+    pub fn hold_for_wait(&self) -> bool {
+        self.reply.hold_for_wait()
+    }
+
     /// Reply to a request with the given open result
     /// # Panics
     /// When attempting to use kernel passthrough.
@@ -849,6 +885,15 @@ impl Reply for ReplyWrite {
 }
 
 impl ReplyWrite {
+    /// CONSTELLATION PATCH (io-uring): as [`ReplyEmpty::hold_for_wait`], for a request of
+    /// this kind that the filesystem finds has to wait (a read or write parked behind a lock
+    /// grant whose renewal is pending): one of its queue's `depth - 1` lock-wait entries, or
+    /// `false` when they are spent and the filesystem must answer now. Always `true` over
+    /// `/dev/fuse`.
+    pub fn hold_for_wait(&self) -> bool {
+        self.reply.hold_for_wait()
+    }
+
     /// Reply to a request with the number of bytes written
     pub fn written(self, size: u32) {
         self.reply.send_ll(&ll::ResponseStruct::new_write(size));
@@ -918,6 +963,15 @@ impl Reply for ReplyCreate {
 }
 
 impl ReplyCreate {
+    /// CONSTELLATION PATCH (io-uring): as [`ReplyEmpty::hold_for_wait`], for a request of
+    /// this kind that the filesystem finds has to wait (a read or write parked behind a lock
+    /// grant whose renewal is pending): one of its queue's `depth - 1` lock-wait entries, or
+    /// `false` when they are spent and the filesystem must answer now. Always `true` over
+    /// `/dev/fuse`.
+    pub fn hold_for_wait(&self) -> bool {
+        self.reply.hold_for_wait()
+    }
+
     /// Reply to a request with a newly created file entry and its newly open file handle
     /// # Panics
     /// When attempting to use kernel passthrough. Use `opened_passthrough()` instead.
