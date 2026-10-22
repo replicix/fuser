@@ -11,7 +11,8 @@ change so each can be offered upstream on its own.
 | `ring-idle-wait` | `io-uring` | bounded ring idle wait, stranded-reply and held-entry reporting (`RingHealth`) |
 | `interrupt` | `v0.18.0` | `Filesystem::interrupt` instead of answering `FUSE_INTERRUPT` with `ENOSYS` |
 | `no-fork` | `v0.18.0` | spawn `fusermount3` without `fork` (its socket as stdin) for a mount without `auto_unmount` |
-| `replicix` | — | `ring-idle-wait` + `interrupt` + `no-fork` merged: what the projects build |
+| `readdirplus` | `v0.18.0` | `READDIRPLUS` name-only entries, separate entry/attribute TTLs, `remaining_capacity` |
+| `replicix` | — | `ring-idle-wait` + `interrupt` + `no-fork` + `readdirplus` merged: what the projects build |
 | `master` | — | mirrors upstream `master` |
 
 `io-uring` depends on `handover` (its session changes build on the
@@ -32,7 +33,7 @@ by the user crate (`fuser/io-uring`).
 
 Change the branch the change belongs to, then rebuild `replicix`
 (merge the changed branch into it, or recreate it: `ring-idle-wait`, then
-merge `interrupt` and `no-fork`), run `cargo test --lib` and
+merge `interrupt`, `no-fork` and `readdirplus`), run `cargo test --lib` and
 `cargo test --lib --features io-uring` (the real-kernel ring tests run
 on a host with `fuse.enable_uring=Y`), push, and bump the `rev` in the
 projects.

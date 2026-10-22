@@ -1036,3 +1036,39 @@ be traced at the same time (ptrace drops setuid unless run as root), so the
 spawn flags and a real unprivileged mount (fusermount3 3.14, `hello`
 example: mounted, read, no leaked socket, unmounted) were checked in
 separate runs.
+
+## `READDIRPLUS` entries (branch `readdirplus`)
+
+Stock `ReplyDirectoryPlus::add` takes the node id and the dirent's `ino` and
+type from the entry's attributes, with one timeout for both the name and
+the attributes. A filesystem that serves `READDIRPLUS` needs three things
+it cannot say that way (constellation plan 40):
+
+- **A name-only entry** (`add_name(ino, offset, kind, name)`): node id 0,
+  `entry_valid` and `attr_valid` 0, a zeroed `fuse_attr`, and the real
+  `d_ino` and `d_type`. The kernel (`fuse_direntplus_link`) treats node id 0
+  as "the filesystem did not want to return attributes for this entry": it
+  builds no inode or dentry and takes no lookup reference, so there is
+  nothing to `forget`; it `LOOKUP`s the name when it needs it. The `d_ino`
+  stays real because glibc before 2.36 skips records whose `d_ino` is 0
+  (BZ #12165) and `ls -i` would show 0.
+- **Separate timeouts** (`add_with_ttls(ino, offset, name, entry_ttl,
+  attr_ttl, attr, generation)`): a directory's attributes may be answered
+  with timeout 0 while its name is still cached. `add` is unchanged and
+  delegates with one timeout twice.
+- **`remaining_capacity()`**, on `ReplyDirectory` and `ReplyDirectoryPlus`
+  (as upstream's `c0420fc`): how many bytes the buffer can still take, so a
+  filesystem can decide whether an entry fits before it takes a lookup
+  reference for it. An `add` that does not fit returns true and writes
+  nothing.
+
+`ll::DirEntryPlus` now holds its node id, `d_ino` and type; `new` fills all
+three from the attributes as before. `fuse_attr` derives `FromZeros` for the
+zeroed attributes.
+
+Tests (`cargo test --lib`, Linux for the byte layouts, which are written out
+by hand from the kernel's `fuse_direntplus`: `fuse_entry_out` 128 bytes,
+`fuse_dirent` 24, records padded to 8): `ll::reply::test::reply_directory_plus_with_two_ttls`,
+`reply_directory_plus_name_only`, `reply_directory_plus_full_and_name_only_entries_mix`,
+`remaining_capacity_shrinks_and_full_add_writes_nothing`, and in `reply`:
+`reply_directory_plus_mixes_ttls_and_name_only`, `reply_directory_remaining_capacity`.
