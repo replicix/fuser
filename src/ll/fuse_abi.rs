@@ -25,6 +25,7 @@
 
 use num_enum::TryFromPrimitive;
 use zerocopy::FromBytes;
+use zerocopy::FromZeros;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
@@ -44,7 +45,7 @@ pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = if cfg!(target_os = "macos") {
 };
 
 #[repr(C)]
-#[derive(Debug, IntoBytes, Clone, Copy, KnownLayout, Immutable)]
+#[derive(Debug, IntoBytes, Clone, Copy, KnownLayout, Immutable, FromZeros)]
 pub(crate) struct fuse_attr {
     pub(crate) ino: u64,
     pub(crate) size: u64,

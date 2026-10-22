@@ -723,6 +723,13 @@ impl ReplyDirectory {
             .push(&DirEntry::new(ino, DirEntOffset(offset), kind, name))
     }
 
+    /// The number of bytes left in the reply buffer. An entry takes its
+    /// header and its name, rounded up to 8 bytes; one that does not fit is
+    /// refused by `add` (which returns true) and written nowhere.
+    pub fn remaining_capacity(&self) -> usize {
+        self.data.remaining_capacity()
+    }
+
     /// Reply to a request with the filled directory buffer
     pub fn ok(self) {
         let response: ll::ResponseData = self.data.into();
@@ -759,7 +766,10 @@ impl ReplyDirectoryPlus {
 
     /// Add an entry to the directory reply buffer. Returns true if the buffer is full.
     /// A transparent offset value can be provided for each entry. The kernel uses these
-    /// value to request the next entries in further readdir calls
+    /// value to request the next entries in further readdir calls.
+    ///
+    /// One `ttl` serves as the entry and the attribute timeout; see
+    /// [`add_with_ttls`](Self::add_with_ttls) for two.
     pub fn add<T: AsRef<OsStr>>(
         &mut self,
         ino: INodeNo,
@@ -769,16 +779,69 @@ impl ReplyDirectoryPlus {
         attr: &FileAttr,
         generation: Generation,
     ) -> bool {
+        self.add_with_ttls(ino, offset, name, ttl, ttl, attr, generation)
+    }
+
+    /// Like [`add`](Self::add), with a timeout for the directory entry (the
+    /// name) and another for the attributes, as in a `fuse_entry_out`. A
+    /// filesystem that answers a directory's attributes with a zero timeout,
+    /// say, can still let its name be cached. Returns true if the buffer is
+    /// full, and then writes nothing.
+    ///
+    /// The node id (and so the kernel's lookup count) is `attr.ino`, and the
+    /// entry type comes from `attr.kind`.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_with_ttls<T: AsRef<OsStr>>(
+        &mut self,
+        ino: INodeNo,
+        offset: u64,
+        name: T,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
+        attr: &FileAttr,
+        generation: Generation,
+    ) -> bool {
         let name = name.as_ref();
         self.buf.push(&DirEntryPlus::new(
             ino,
             generation,
             DirEntOffset(offset),
             name,
-            *ttl,
+            *entry_ttl,
             attr.into(),
-            *ttl,
+            *attr_ttl,
         ))
+    }
+
+    /// Add a name-only entry: the kernel gets the name, the inode number
+    /// `ino` (what `getdents` reports as `d_ino`) and the type `kind`, but
+    /// no node id and no attributes. It creates no inode for it and takes no
+    /// lookup reference, so the filesystem needs no `forget` for it; the
+    /// name is looked up when it is used. Returns true if the buffer is full,
+    /// and then writes nothing.
+    #[must_use]
+    pub fn add_name<T: AsRef<OsStr>>(
+        &mut self,
+        ino: INodeNo,
+        offset: u64,
+        kind: FileType,
+        name: T,
+    ) -> bool {
+        let name = name.as_ref();
+        self.buf.push(&DirEntryPlus::name_only(
+            ino,
+            DirEntOffset(offset),
+            kind,
+            name,
+        ))
+    }
+
+    /// The number of bytes left in the reply buffer. An entry takes its
+    /// header (a `fuse_direntplus`, 152 bytes on Linux) and its name, rounded up to 8
+    /// bytes; one that does not fit is refused and written nowhere.
+    pub fn remaining_capacity(&self) -> usize {
+        self.buf.remaining_capacity()
     }
 
     /// Reply to a request with the filled directory buffer
@@ -1231,6 +1294,122 @@ mod test {
         let mut reply = ReplyDirectory::new(ll::RequestId(0xdeadbeef), sender, 4096);
         assert!(!reply.add(INodeNo(0xaabb), 1, FileType::Directory, "hello"));
         assert!(!reply.add(INodeNo(0xccdd), 2, FileType::RegularFile, "world.rs"));
+        reply.ok();
+    }
+
+    /// A `ReplyDirectoryPlus` with `add_with_ttls` and `add_name` entries, checked
+    /// against the kernel's `fuse_direntplus` layout (`fuse_entry_out`, 128 bytes,
+    /// then `fuse_dirent`, 24, padded to 8).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reply_directory_plus_mixes_ttls_and_name_only() {
+        let time = UNIX_EPOCH + Duration::new(0x1234, 0x5678);
+        let attr = FileAttr {
+            ino: INodeNo(0x11),
+            size: 0x22,
+            blocks: 0x33,
+            atime: time,
+            mtime: time,
+            ctime: time,
+            crtime: time,
+            kind: FileType::Directory,
+            perm: 0o755,
+            nlink: 2,
+            uid: 3,
+            gid: 4,
+            rdev: 0,
+            flags: 0,
+            blksize: 0x1000,
+        };
+        let mut expected = Vec::new();
+        // 1: add_with_ttls: entry 60 s, attributes 0 s; nodeid, d_ino and type from attr.
+        expected.extend(0x11u64.to_le_bytes()); // nodeid
+        expected.extend(0xaau64.to_le_bytes()); // generation
+        expected.extend(60u64.to_le_bytes()); // entry_valid
+        expected.extend(0u64.to_le_bytes()); // attr_valid
+        expected.extend(0u32.to_le_bytes()); // entry_valid_nsec
+        expected.extend(0u32.to_le_bytes()); // attr_valid_nsec
+        for x in [0x11u64, 0x22, 0x33, 0x1234, 0x1234, 0x1234] {
+            expected.extend(x.to_le_bytes());
+        }
+        for x in [0x5678u32, 0x5678, 0x5678, 0o040755, 2, 3, 4, 0, 0x1000, 0] {
+            expected.extend(x.to_le_bytes());
+        }
+        expected.extend(0x11u64.to_le_bytes()); // dirent ino
+        expected.extend(1u64.to_le_bytes()); // off
+        expected.extend(3u32.to_le_bytes()); // namelen
+        expected.extend(4u32.to_le_bytes()); // DT_DIR
+        expected.extend(b"dir\0\0\0\0\0");
+        // 2: add_name: nodeid 0, zero attributes, real d_ino, DT_REG.
+        expected.extend([0u8; 128]);
+        expected.extend(0x77u64.to_le_bytes());
+        expected.extend(2u64.to_le_bytes());
+        expected.extend(1u32.to_le_bytes());
+        expected.extend(8u32.to_le_bytes());
+        expected.extend(b"f\0\0\0\0\0\0\0");
+        // 3: add, one ttl for both.
+        expected.extend(0x11u64.to_le_bytes());
+        expected.extend(0xabu64.to_le_bytes());
+        expected.extend(5u64.to_le_bytes());
+        expected.extend(5u64.to_le_bytes());
+        expected.extend([0u8; 8]);
+        let attr_start = expected.len();
+        for x in [0x11u64, 0x22, 0x33, 0x1234, 0x1234, 0x1234] {
+            expected.extend(x.to_le_bytes());
+        }
+        for x in [0x5678u32, 0x5678, 0x5678, 0o040755, 2, 3, 4, 0, 0x1000, 0] {
+            expected.extend(x.to_le_bytes());
+        }
+        assert_eq!(expected.len() - attr_start, 88);
+        expected.extend(0x11u64.to_le_bytes());
+        expected.extend(3u64.to_le_bytes());
+        expected.extend(1u32.to_le_bytes());
+        expected.extend(4u32.to_le_bytes());
+        expected.extend(b"x\0\0\0\0\0\0\0");
+        let mut full = Vec::new();
+        full.extend(((16 + expected.len()) as u32).to_le_bytes());
+        full.extend(0i32.to_le_bytes());
+        full.extend(0xdeadbeefu64.to_le_bytes());
+        full.extend(expected);
+
+        let sender = ReplySender::Assert(AssertSender { expected: full });
+        let mut reply = ReplyDirectoryPlus::new(ll::RequestId(0xdeadbeef), sender, 4096);
+        assert_eq!(reply.remaining_capacity(), 4096);
+        assert!(!reply.add_with_ttls(
+            INodeNo(0x11),
+            1,
+            "dir",
+            &Duration::from_secs(60),
+            &Duration::ZERO,
+            &attr,
+            Generation(0xaa),
+        ));
+        assert_eq!(reply.remaining_capacity(), 4096 - 160);
+        assert!(!reply.add_name(INodeNo(0x77), 2, FileType::RegularFile, "f"));
+        assert_eq!(reply.remaining_capacity(), 4096 - 320);
+        let five = Duration::from_secs(5);
+        assert!(!reply.add(INodeNo(0x11), 3, "x", &five, &attr, Generation(0xab)));
+        assert_eq!(reply.remaining_capacity(), 4096 - 480);
+        reply.ok();
+    }
+
+    #[test]
+    fn reply_directory_remaining_capacity() {
+        let sender = ReplySender::Assert(AssertSender {
+            expected: vec![
+                0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde, 0x00, 0x00,
+                0x00, 0x00, 0xbb, 0xaa, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x68, 0x65,
+                0x6c, 0x6c, 0x6f, 0x00, 0x00, 0x00,
+            ],
+        });
+        let mut reply = ReplyDirectory::new(ll::RequestId(0xdeadbeef), sender, 40);
+        assert_eq!(reply.remaining_capacity(), 40);
+        assert!(!reply.add(INodeNo(0xaabb), 1, FileType::Directory, "hello"));
+        assert_eq!(reply.remaining_capacity(), 8);
+        // Does not fit: refused, and the buffer stays as it was.
+        assert!(reply.add(INodeNo(0xccdd), 2, FileType::RegularFile, "b"));
+        assert_eq!(reply.remaining_capacity(), 8);
         reply.ok();
     }
 
