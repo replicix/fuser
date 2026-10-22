@@ -8,6 +8,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use smallvec::SmallVec;
+use zerocopy::FromZeros;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
@@ -400,6 +401,11 @@ impl EntListBuf {
         }
     }
 
+    /// The number of bytes that can still be added before an entry is refused.
+    pub(crate) fn remaining_capacity(&self) -> usize {
+        self.max_size.saturating_sub(self.buf.len())
+    }
+
     /// Add an entry to the directory reply buffer. Returns true if the buffer is full.
     /// A transparent offset value can be provided for each entry. The kernel uses these
     /// value to request the next entries in further readdir calls
@@ -457,6 +463,9 @@ impl DirEntList {
     pub(crate) fn new(max_size: usize) -> Self {
         Self(EntListBuf::new(max_size))
     }
+    pub(crate) fn remaining_capacity(&self) -> usize {
+        self.0.remaining_capacity()
+    }
     /// Add an entry to the directory reply buffer. Returns true if the buffer is full.
     /// A transparent offset value can be provided for each entry. The kernel uses these
     /// value to request the next entries in further readdir calls
@@ -475,8 +484,13 @@ impl DirEntList {
 
 #[derive(Debug)]
 pub(crate) struct DirEntryPlus<T: AsRef<Path>> {
-    #[allow(unused)] // We use `attr.ino` instead
-    ino: INodeNo,
+    /// The `nodeid` of the `fuse_entry_out`. Zero means "no entry": the kernel
+    /// takes the name only and looks it up later.
+    nodeid: u64,
+    /// The `ino` of the `fuse_dirent` (what `getdents` reports as `d_ino`).
+    d_ino: u64,
+    /// The `typ` of the `fuse_dirent` (the file type bits of the mode, shifted).
+    typ: u32,
     generation: Generation,
     offset: DirEntOffset,
     name: T,
@@ -486,8 +500,10 @@ pub(crate) struct DirEntryPlus<T: AsRef<Path>> {
 }
 
 impl<T: AsRef<Path>> DirEntryPlus<T> {
+    /// A full entry. As for a lookup reply, the node id, the dirent's `ino`
+    /// and its type all come from `attr`; `ino` is not used.
     pub(crate) fn new(
-        ino: INodeNo,
+        _ino: INodeNo,
         generation: Generation,
         offset: DirEntOffset,
         name: T,
@@ -496,13 +512,34 @@ impl<T: AsRef<Path>> DirEntryPlus<T> {
         attr_valid: Duration,
     ) -> Self {
         Self {
-            ino,
+            nodeid: attr.attr.ino,
+            d_ino: attr.attr.ino,
+            typ: attr.attr.mode >> 12,
             generation,
             offset,
             name,
             entry_valid,
             attr,
             attr_valid,
+        }
+    }
+
+    /// A name-only entry: node id 0 (the kernel creates no dentry or inode
+    /// for it and `LOOKUP`s the name when it is needed), zero timeouts and a
+    /// zeroed `fuse_attr`. The dirent still carries the real `d_ino` and type.
+    pub(crate) fn name_only(ino: INodeNo, offset: DirEntOffset, kind: FileType, name: T) -> Self {
+        Self {
+            nodeid: 0,
+            d_ino: ino.into(),
+            typ: mode_from_kind_and_perm(kind, 0) >> 12,
+            generation: Generation(0),
+            offset,
+            name,
+            entry_valid: Duration::ZERO,
+            attr: Attr {
+                attr: abi::fuse_attr::new_zeroed(),
+            },
+            attr_valid: Duration::ZERO,
         }
     }
 }
@@ -521,6 +558,9 @@ impl DirEntPlusList {
     pub(crate) fn new(max_size: usize) -> Self {
         Self(EntListBuf::new(max_size))
     }
+    pub(crate) fn remaining_capacity(&self) -> usize {
+        self.0.remaining_capacity()
+    }
     /// Add an entry to the directory reply buffer. Returns true if the buffer is full.
     /// A transparent offset value can be provided for each entry. The kernel uses these
     /// value to request the next entries in further readdir calls
@@ -529,7 +569,7 @@ impl DirEntPlusList {
         let name = x.name.as_ref().as_os_str().as_bytes();
         let header = abi::fuse_direntplus {
             entry_out: abi::fuse_entry_out {
-                nodeid: x.attr.attr.ino,
+                nodeid: x.nodeid,
                 generation: x.generation.into(),
                 entry_valid: x.entry_valid.as_secs(),
                 attr_valid: x.attr_valid.as_secs(),
@@ -538,10 +578,10 @@ impl DirEntPlusList {
                 attr: x.attr.attr,
             },
             dirent: abi::fuse_dirent {
-                ino: x.attr.attr.ino,
+                ino: x.d_ino,
                 off: x.offset.0,
                 namelen: name.len().try_into().expect("Name too long"),
-                typ: x.attr.attr.mode >> 12,
+                typ: x.typ,
             },
         };
         self.0.push([header.as_bytes(), name])
@@ -928,5 +968,332 @@ mod test {
             r.with_iovec(RequestId(0xdeadbeef), ioslice_to_vec),
             expected
         );
+    }
+
+    /// The bytes of a `fuse_direntplus` and its name, laid out by hand from
+    /// the kernel's `include/uapi/linux/fuse.h` (Linux: `fuse_entry_out` is
+    /// 128 bytes, `fuse_dirent` 24, the record is padded to 8), not from
+    /// this crate's structs.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn kernel_direntplus(
+        nodeid: u64,
+        generation: u64,
+        entry_valid: (u64, u32),
+        attr_valid: (u64, u32),
+        attr: &[u8],
+        d_ino: u64,
+        off: u64,
+        typ: u32,
+        name: &[u8],
+    ) -> Vec<u8> {
+        assert_eq!(attr.len(), 88); // struct fuse_attr
+        let mut v = Vec::new();
+        // struct fuse_entry_out
+        v.extend(nodeid.to_le_bytes());
+        v.extend(generation.to_le_bytes());
+        v.extend(entry_valid.0.to_le_bytes());
+        v.extend(attr_valid.0.to_le_bytes());
+        v.extend(entry_valid.1.to_le_bytes());
+        v.extend(attr_valid.1.to_le_bytes());
+        v.extend(attr);
+        assert_eq!(v.len(), 128);
+        // struct fuse_dirent
+        v.extend(d_ino.to_le_bytes());
+        v.extend(off.to_le_bytes());
+        v.extend((name.len() as u32).to_le_bytes());
+        v.extend(typ.to_le_bytes());
+        assert_eq!(v.len(), 152);
+        v.extend(name);
+        while v.len() % 8 != 0 {
+            v.push(0);
+        }
+        v
+    }
+
+    /// A reply carrying `payload`: `fuse_out_header` (len, error 0, unique).
+    #[cfg(target_os = "linux")]
+    fn kernel_reply(unique: u64, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend(((16 + payload.len()) as u32).to_le_bytes());
+        v.extend(0i32.to_le_bytes());
+        v.extend(unique.to_le_bytes());
+        v.extend(payload);
+        v
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_attr() -> crate::FileAttr {
+        let time = UNIX_EPOCH + Duration::new(0x1234, 0x5678);
+        crate::FileAttr {
+            ino: INodeNo(0x11),
+            size: 0x22,
+            blocks: 0x33,
+            atime: time,
+            mtime: time,
+            ctime: time,
+            crtime: time,
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            nlink: 0x55,
+            uid: 0x66,
+            gid: 0x77,
+            rdev: 0x88,
+            flags: 0,
+            blksize: 0xbb,
+        }
+    }
+
+    /// `test_attr` as the kernel's `struct fuse_attr`.
+    #[cfg(target_os = "linux")]
+    fn test_attr_bytes() -> Vec<u8> {
+        let mut v = Vec::new();
+        for x in [0x11u64, 0x22, 0x33, 0x1234, 0x1234, 0x1234] {
+            v.extend(x.to_le_bytes()); // ino size blocks atime mtime ctime
+        }
+        for x in [
+            0x5678u32, 0x5678, 0x5678, 0o100644, 0x55, 0x66, 0x77, 0x88, 0xbb, 0,
+        ] {
+            v.extend(x.to_le_bytes()); // *nsec x3 mode nlink uid gid rdev blksize flags
+        }
+        v
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reply_directory_plus_with_two_ttls() {
+        let mut buf = DirEntPlusList::new(4096);
+        let attr: Attr = test_attr().into();
+        let entry_ttl = Duration::new(0x8765, 0x4321);
+        let attr_ttl = Duration::new(0, 0x99);
+        assert!(!buf.push(&DirEntryPlus::new(
+            INodeNo(0x11),
+            Generation(0xaa),
+            DirEntOffset(7),
+            "world.rs",
+            entry_ttl,
+            attr,
+            attr_ttl,
+        )));
+        // The same ttl twice is what `ReplyDirectoryPlus::add` writes.
+        let mut dir_attr = test_attr();
+        dir_attr.ino = INodeNo(0x12);
+        dir_attr.kind = FileType::Directory;
+        dir_attr.perm = 0o755;
+        assert!(!buf.push(&DirEntryPlus::new(
+            INodeNo(0x12),
+            Generation(0xab),
+            DirEntOffset(8),
+            "d",
+            attr_ttl,
+            dir_attr.into(),
+            Duration::ZERO,
+        )));
+
+        let mut attr2 = test_attr_bytes();
+        attr2[0..8].copy_from_slice(&0x12u64.to_le_bytes());
+        attr2[60..64].copy_from_slice(&0o040755u32.to_le_bytes());
+        let mut payload = kernel_direntplus(
+            0x11,
+            0xaa,
+            (0x8765, 0x4321),
+            (0, 0x99),
+            &test_attr_bytes(),
+            0x11,
+            7,
+            8, // DT_REG
+            b"world.rs",
+        );
+        payload.extend(kernel_direntplus(
+            0x12,
+            0xab,
+            (0, 0x99),
+            (0, 0),
+            &attr2,
+            0x12,
+            8,
+            4, // DT_DIR
+            b"d",
+        ));
+        let r: ResponseData = buf.into();
+        assert_eq!(
+            r.with_iovec(RequestId(0xdeadbeef), ioslice_to_vec),
+            kernel_reply(0xdeadbeef, &payload)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reply_directory_plus_name_only() {
+        let mut buf = DirEntPlusList::new(4096);
+        // A name whose record needs padding (9 bytes), and one that does not.
+        assert!(!buf.push(&DirEntryPlus::name_only(
+            INodeNo(0xaabb),
+            DirEntOffset(3),
+            FileType::Directory,
+            "some-name"
+        )));
+        assert!(!buf.push(&DirEntryPlus::name_only(
+            INodeNo(0xccdd),
+            DirEntOffset(4),
+            FileType::Symlink,
+            "12345678"
+        )));
+        assert!(!buf.push(&DirEntryPlus::name_only(
+            INodeNo(0xeeff),
+            DirEntOffset(5),
+            FileType::RegularFile,
+            "f"
+        )));
+        let zero_attr = [0u8; 88];
+        let mut payload = kernel_direntplus(
+            0,
+            0,
+            (0, 0),
+            (0, 0),
+            &zero_attr,
+            0xaabb,
+            3,
+            4, // DT_DIR
+            b"some-name",
+        );
+        payload.extend(kernel_direntplus(
+            0,
+            0,
+            (0, 0),
+            (0, 0),
+            &zero_attr,
+            0xccdd,
+            4,
+            10, // DT_LNK
+            b"12345678",
+        ));
+        payload.extend(kernel_direntplus(
+            0,
+            0,
+            (0, 0),
+            (0, 0),
+            &zero_attr,
+            0xeeff,
+            5,
+            8, // DT_REG
+            b"f",
+        ));
+        assert_eq!(payload.len(), 168 + 160 + 160);
+        let r: ResponseData = buf.into();
+        assert_eq!(
+            r.with_iovec(RequestId(0xdeadbeef), ioslice_to_vec),
+            kernel_reply(0xdeadbeef, &payload)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reply_directory_plus_full_and_name_only_entries_mix() {
+        let mut buf = DirEntPlusList::new(4096);
+        assert!(!buf.push(&DirEntryPlus::name_only(
+            INodeNo(5),
+            DirEntOffset(1),
+            FileType::RegularFile,
+            "a"
+        )));
+        assert!(!buf.push(&DirEntryPlus::new(
+            INodeNo(0x11),
+            Generation(1),
+            DirEntOffset(2),
+            "b",
+            Duration::from_secs(1),
+            test_attr().into(),
+            Duration::from_secs(2),
+        )));
+        let mut payload = kernel_direntplus(0, 0, (0, 0), (0, 0), &[0; 88], 5, 1, 8, b"a");
+        payload.extend(kernel_direntplus(
+            0x11,
+            1,
+            (1, 0),
+            (2, 0),
+            &test_attr_bytes(),
+            0x11,
+            2,
+            8,
+            b"b",
+        ));
+        let r: ResponseData = buf.into();
+        assert_eq!(
+            r.with_iovec(RequestId(1), ioslice_to_vec),
+            kernel_reply(1, &payload)
+        );
+    }
+
+    #[test]
+    fn remaining_capacity_shrinks_and_full_add_writes_nothing() {
+        // A plus record for a one-byte name is 160 bytes.
+        let mut buf = DirEntPlusList::new(400);
+        assert_eq!(buf.remaining_capacity(), 400);
+        assert!(!buf.push(&DirEntryPlus::name_only(
+            INodeNo(1),
+            DirEntOffset(1),
+            FileType::RegularFile,
+            "a"
+        )));
+        assert_eq!(buf.remaining_capacity(), 240);
+        assert!(!buf.push(&DirEntryPlus::name_only(
+            INodeNo(2),
+            DirEntOffset(2),
+            FileType::RegularFile,
+            "b"
+        )));
+        assert_eq!(buf.remaining_capacity(), 80);
+        // Does not fit: the buffer is full (true) and unchanged.
+        assert!(buf.push(&DirEntryPlus::name_only(
+            INodeNo(3),
+            DirEntOffset(3),
+            FileType::RegularFile,
+            "c"
+        )));
+        assert_eq!(buf.remaining_capacity(), 80);
+        let before: ResponseData = {
+            let mut same = DirEntPlusList::new(400);
+            for (i, n) in [(1u64, "a"), (2, "b")] {
+                assert!(!same.push(&DirEntryPlus::name_only(
+                    INodeNo(i),
+                    DirEntOffset(i),
+                    FileType::RegularFile,
+                    n
+                )));
+            }
+            same.into()
+        };
+        let after: ResponseData = buf.into();
+        assert_eq!(
+            after.with_iovec(RequestId(1), ioslice_to_vec),
+            before.with_iovec(RequestId(1), ioslice_to_vec)
+        );
+
+        // An exact fit is accepted and leaves no capacity; the plain list too.
+        let mut exact = DirEntPlusList::new(160);
+        assert!(!exact.push(&DirEntryPlus::name_only(
+            INodeNo(1),
+            DirEntOffset(1),
+            FileType::RegularFile,
+            "a"
+        )));
+        assert_eq!(exact.remaining_capacity(), 0);
+
+        let mut plain = DirEntList::new(40);
+        assert!(!plain.push(&DirEntry::new(
+            INodeNo(1),
+            DirEntOffset(1),
+            FileType::RegularFile,
+            "abcdefgh" // 24 + 8
+        )));
+        assert_eq!(plain.remaining_capacity(), 8);
+        assert!(plain.push(&DirEntry::new(
+            INodeNo(2),
+            DirEntOffset(2),
+            FileType::RegularFile,
+            "b" // 25 -> 32 > 8
+        )));
+        assert_eq!(plain.remaining_capacity(), 8);
     }
 }
